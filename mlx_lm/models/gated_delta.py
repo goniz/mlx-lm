@@ -115,10 +115,122 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
     )
 
 
+def _is_vulkan_available():
+    vulkan = getattr(mx, "vulkan", None)
+    return vulkan is not None and vulkan.is_available()
+
+
+def _make_gated_delta_vulkan_kernel(has_mask=False, vectorized=False):
+    if not _is_vulkan_available():
+        return None
+    vulkan_kernel = getattr(mx.fast, "vulkan_kernel", None)
+    if vulkan_kernel is None:
+        return None
+
+    mask_source = "(mask.data[b_idx * T + t] != uint8_t(0))" if has_mask else "true"
+    if vectorized:
+        g_access = "read_GtT(g.data[((b_idx * T + t) * Hv + hv_idx) * Dk + s_idx])"
+    else:
+        g_access = "read_GtT(g.data[(b_idx * T + t) * Hv + hv_idx])"
+
+    source = f"""
+        uint n = gl_GlobalInvocationID.z;
+        uint b_idx = n / uint(Hv);
+        uint hv_idx = n % uint(Hv);
+        uint hk_idx = hv_idx / uint(Hv / Hk);
+        uint dk_lane = gl_LocalInvocationID.x;
+        uint dv_idx = gl_GlobalInvocationID.y;
+        bool active_dv = dv_idx < uint(Dv);
+        const uint n_per_t = uint(Dk / 32);
+
+        uint state_base = ((b_idx * uint(Hv) + hv_idx) * uint(Dv) + dv_idx) * uint(Dk);
+        float state[8];
+        for (uint i = 0; i < n_per_t; ++i) {{
+          uint s_idx = n_per_t * dk_lane + i;
+          state[i] = active_dv ? read_StT(state_in.data[state_base + s_idx]) : 0.0;
+        }}
+
+        for (uint t = 0; t < uint(T); ++t) {{
+          bool is_active = active_dv && ({mask_source});
+          float kv_mem = 0.0;
+          for (uint i = 0; i < n_per_t; ++i) {{
+            uint s_idx = n_per_t * dk_lane + i;
+            uint qk_idx = ((b_idx * uint(T) + t) * uint(Hk) + hk_idx) * uint(Dk) + s_idx;
+            if (is_active) {{
+              state[i] *= {g_access};
+              kv_mem += state[i] * read_InT(k.data[qk_idx]);
+            }}
+          }}
+
+          kv_mem = subgroupAdd(kv_mem);
+
+          uint v_idx = ((b_idx * uint(T) + t) * uint(Hv) + hv_idx) * uint(Dv) + dv_idx;
+          float delta = is_active
+              ? (read_InT(v.data[v_idx]) - kv_mem) *
+                    read_BtT(beta.data[(b_idx * uint(T) + t) * uint(Hv) + hv_idx])
+              : 0.0;
+
+          float out_acc = 0.0;
+          for (uint i = 0; i < n_per_t; ++i) {{
+            uint s_idx = n_per_t * dk_lane + i;
+            uint qk_idx = ((b_idx * uint(T) + t) * uint(Hk) + hk_idx) * uint(Dk) + s_idx;
+            if (is_active) {{
+              state[i] += read_InT(k.data[qk_idx]) * delta;
+              out_acc += state[i] * read_InT(q.data[qk_idx]);
+            }}
+          }}
+
+          out_acc = subgroupAdd(out_acc);
+          if (dk_lane == 0 && active_dv) {{
+            y.data[v_idx] = write_InT(is_active ? out_acc : 0.0);
+          }}
+        }}
+
+        if (active_dv) {{
+          for (uint i = 0; i < n_per_t; ++i) {{
+            uint s_idx = n_per_t * dk_lane + i;
+            state_out.data[state_base + s_idx] = write_StT(state[i]);
+          }}
+        }}
+    """
+    inputs = ["q", "k", "v", "g", "beta", "state_in"]
+    if has_mask:
+        inputs.append("mask")
+
+    suffix = ""
+    if vectorized:
+        suffix += "_vec"
+    if has_mask:
+        suffix += "_mask"
+
+    try:
+        return vulkan_kernel(
+            name=f"gated_delta_step{suffix}",
+            input_names=inputs,
+            output_names=["y", "state_out"],
+            header="#extension GL_KHR_shader_subgroup_arithmetic : require\n",
+            source=source,
+        )
+    except RuntimeError:
+        return None
+
+
 _gated_delta_kernel = _make_gated_delta_kernel(has_mask=False, vectorized=False)
 _gated_delta_kernel_masked = _make_gated_delta_kernel(has_mask=True, vectorized=False)
 _gated_delta_kernel_vec = _make_gated_delta_kernel(has_mask=False, vectorized=True)
 _gated_delta_kernel_vec_masked = _make_gated_delta_kernel(
+    has_mask=True, vectorized=True
+)
+_gated_delta_vulkan_kernel = _make_gated_delta_vulkan_kernel(
+    has_mask=False, vectorized=False
+)
+_gated_delta_vulkan_kernel_masked = _make_gated_delta_vulkan_kernel(
+    has_mask=True, vectorized=False
+)
+_gated_delta_vulkan_kernel_vec = _make_gated_delta_vulkan_kernel(
+    has_mask=False, vectorized=True
+)
+_gated_delta_vulkan_kernel_vec_masked = _make_gated_delta_vulkan_kernel(
     has_mask=True, vectorized=True
 )
 
@@ -194,6 +306,9 @@ def gated_delta_kernel(
             kernel = _gated_delta_kernel_masked
             inputs.append(mask)
 
+    if kernel is None:
+        return gated_delta_ops(q, k, v, g, beta, state, mask)
+
     return kernel(
         inputs=inputs,
         template=[
@@ -209,6 +324,66 @@ def gated_delta_kernel(
         output_shapes=[(B, T, Hv, Dv), state.shape],
         output_dtypes=[input_type, state_type],
     )
+
+
+def gated_delta_vulkan_kernel(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    state: mx.array,
+    mask: Optional[mx.array] = None,
+) -> Tuple[mx.array, mx.array]:
+    B, T, Hk, Dk = k.shape
+    Hv, Dv = v.shape[2:]
+    input_type = q.dtype
+    state_type = state.dtype
+    if Dk % 32 != 0 or Dk // 32 > 8:
+        return gated_delta_ops(q, k, v, g, beta, state, mask)
+
+    if g.ndim == 4:
+        kernel = _gated_delta_vulkan_kernel_vec
+        inputs = [q, k, v, g, beta, state]
+        if mask is not None:
+            kernel = _gated_delta_vulkan_kernel_vec_masked
+            inputs.append(mask)
+    else:
+        kernel = _gated_delta_vulkan_kernel
+        inputs = [q, k, v, g, beta, state]
+        if mask is not None:
+            kernel = _gated_delta_vulkan_kernel_masked
+            inputs.append(mask)
+
+    if kernel is None:
+        return gated_delta_ops(q, k, v, g, beta, state, mask)
+
+    return kernel(
+        inputs=inputs,
+        template=[
+            ("InT", input_type),
+            ("StT", state_type),
+            ("GtT", g.dtype),
+            ("BtT", beta.dtype),
+            ("T", T),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+        ],
+        grid=(32, Dv, B * Hv),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(B, T, Hv, Dv), state.shape],
+        output_dtypes=[input_type, state_type],
+    )
+
+
+def _select_gated_delta_kernel():
+    if mx.metal.is_available():
+        return gated_delta_kernel
+    if _is_vulkan_available():
+        return gated_delta_vulkan_kernel
+    return None
 
 
 def gated_delta_ops(
@@ -278,6 +453,8 @@ def gated_delta_update(
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+    if not use_kernel or mx.default_device() != mx.gpu:
         return gated_delta_ops(q, k, v, g, beta, state, mask)
-    return gated_delta_kernel(q, k, v, g, beta, state, mask)
+    if kernel := _select_gated_delta_kernel():
+        return kernel(q, k, v, g, beta, state, mask)
+    return gated_delta_ops(q, k, v, g, beta, state, mask)
