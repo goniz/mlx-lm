@@ -120,11 +120,37 @@ def _is_vulkan_available():
     return vulkan is not None and vulkan.is_available()
 
 
+_vulkan_subgroup_size_cache = None
+
+
+def _vulkan_subgroup_size():
+    global _vulkan_subgroup_size_cache
+    if _vulkan_subgroup_size_cache is not None:
+        return _vulkan_subgroup_size_cache
+    if not _is_vulkan_available():
+        return 0
+    try:
+        info = mx.device_info(mx.Device(mx.gpu, 0))
+    except Exception:
+        return 0
+    _vulkan_subgroup_size_cache = int(info.get("subgroup_size", 0) or 0)
+    return _vulkan_subgroup_size_cache
+
+
 def _make_gated_delta_vulkan_kernel(has_mask=False, vectorized=False):
     if not _is_vulkan_available():
         return None
     vulkan_kernel = getattr(mx.fast, "vulkan_kernel", None)
     if vulkan_kernel is None:
+        return None
+    sg = _vulkan_subgroup_size()
+    # The kernel uses a single `subgroupAdd` to reduce the workgroup, which
+    # is only correct when the workgroup spans a whole number of subgroups.
+    # Specialize the kernel on the device's subgroup size so the workgroup
+    # matches one subgroup exactly: this lets `subgroupAdd` cover the full
+    # workgroup, allows larger Dk (n_per_t = Dk / SG with the state[8] bound
+    # scales linearly with SG), and uses the hardware's full reduction width.
+    if sg < 32:
         return None
 
     mask_source = "(mask.data[b_idx * T + t] != uint8_t(0))" if has_mask else "true"
@@ -141,7 +167,7 @@ def _make_gated_delta_vulkan_kernel(has_mask=False, vectorized=False):
         uint dk_lane = gl_LocalInvocationID.x;
         uint dv_idx = gl_GlobalInvocationID.y;
         bool active_dv = dv_idx < uint(Dv);
-        const uint n_per_t = uint(Dk / 32);
+        const uint n_per_t = uint(Dk / SG);
 
         uint state_base = ((b_idx * uint(Hv) + hv_idx) * uint(Dv) + dv_idx) * uint(Dk);
         float state[8];
@@ -205,7 +231,7 @@ def _make_gated_delta_vulkan_kernel(has_mask=False, vectorized=False):
 
     try:
         return vulkan_kernel(
-            name=f"gated_delta_step{suffix}",
+            name=f"gated_delta_step{suffix}_sg{sg}",
             input_names=inputs,
             output_names=["y", "state_out"],
             header="#extension GL_KHR_shader_subgroup_arithmetic : require\n",
@@ -339,7 +365,8 @@ def gated_delta_vulkan_kernel(
     Hv, Dv = v.shape[2:]
     input_type = q.dtype
     state_type = state.dtype
-    if Dk % 32 != 0 or Dk // 32 > 8:
+    sg = _vulkan_subgroup_size()
+    if sg < 32 or Dk % sg != 0 or Dk // sg > 8:
         return gated_delta_ops(q, k, v, g, beta, state, mask)
 
     if g.ndim == 4:
@@ -370,9 +397,10 @@ def gated_delta_vulkan_kernel(
             ("Dv", Dv),
             ("Hk", Hk),
             ("Hv", Hv),
+            ("SG", sg),
         ],
-        grid=(32, Dv, B * Hv),
-        threadgroup=(32, 1, 1),
+        grid=(sg, Dv, B * Hv),
+        threadgroup=(sg, 1, 1),
         output_shapes=[(B, T, Hv, Dv), state.shape],
         output_dtypes=[input_type, state_type],
     )
