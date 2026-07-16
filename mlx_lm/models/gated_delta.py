@@ -127,6 +127,7 @@ def _is_vulkan_available():
 
 
 _vulkan_subgroup_size_cache = None
+_vulkan_subgroup_clustered_cache = None
 
 
 def _vulkan_subgroup_size():
@@ -143,17 +144,47 @@ def _vulkan_subgroup_size():
     return _vulkan_subgroup_size_cache
 
 
+def _vulkan_supports_subgroup_clustered():
+    """True when VK_SUBGROUP_FEATURE_CLUSTERED_BIT is available for compute.
+
+    Pack>1 kernels require subgroupClusteredAdd. The capability must be
+    queried up front: ``vulkan_kernel()`` construction is lazy, so a
+    try/except around kernel creation cannot detect compile/pipeline failure.
+    """
+    global _vulkan_subgroup_clustered_cache
+    if _vulkan_subgroup_clustered_cache is not None:
+        return _vulkan_subgroup_clustered_cache
+    if not _is_vulkan_available():
+        _vulkan_subgroup_clustered_cache = False
+        return False
+    try:
+        info = mx.device_info(mx.Device(mx.gpu, 0))
+        # Prefer the device_info flag from the Vulkan backend when present.
+        if "subgroup_clustered" in info:
+            _vulkan_subgroup_clustered_cache = bool(info["subgroup_clustered"])
+            return _vulkan_subgroup_clustered_cache
+    except Exception:
+        pass
+    # Older MLX builds without the flag: refuse pack>1 rather than risk a
+    # late pipeline-create crash.
+    _vulkan_subgroup_clustered_cache = False
+    return False
+
+
 def _vulkan_dv_pack(sg: int, dk: int = 0) -> int:
     """Number of Dv rows packed into one Vulkan subgroup.
 
     Uses clustered subgroup reductions so ``sg / pack`` lanes cooperate on
     each Dv row (Metal packed-GDN / llama.cpp column packing). ``pack`` must
     divide ``sg``; each lane holds ``dk / (sg / pack)`` state elements.
+    Requires subgroup clustered ops when pack > 1.
     """
     if sg < 32:
         return 1
     pack = min(_VULKAN_DV_PACK, sg)
     if pack <= 1:
+        return 1
+    if not _vulkan_supports_subgroup_clustered():
         return 1
     # Prefer the largest power-of-two pack that divides sg and keeps a
     # reasonable per-lane state footprint (state[32] bound below).
@@ -176,6 +207,8 @@ def _make_gated_delta_vulkan_kernel(has_mask=False, vectorized=False, dv_pack: i
     # Workgroup is one subgroup. dv_pack Dv rows share that subgroup;
     # LANES_PER_DV = SG / DV_PACK lanes reduce each row with clustered add.
     if sg < 32 or dv_pack < 1 or sg % dv_pack != 0:
+        return None
+    if dv_pack > 1 and not _vulkan_supports_subgroup_clustered():
         return None
     lanes_per_dv = sg // dv_pack
 
@@ -203,7 +236,10 @@ def _make_gated_delta_vulkan_kernel(has_mask=False, vectorized=False, dv_pack: i
         uint b_idx = n / uint(Hv);
         uint hv_idx = n % uint(Hv);
         uint hk_idx = hv_idx / uint(Hv / Hk);
-        uint lane = gl_LocalInvocationID.x;
+        // Cluster membership is defined by SubgroupInvocationID. Local and
+        // subgroup IDs are not required to match, so derive row/lane from the
+        // subgroup ID (same as llama.cpp gated_delta_net.comp).
+        uint lane = gl_SubgroupInvocationID;
         uint dv_local = lane / {lanes_per_dv}u;
         uint dk_lane = lane % {lanes_per_dv}u;
         uint dv_idx = gl_WorkGroupID.y * {dv_pack}u + dv_local;
