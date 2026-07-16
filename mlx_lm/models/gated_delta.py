@@ -1,8 +1,14 @@
+import os
 from functools import partial
 from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+
+# Pack this many Dv rows into one Vulkan subgroup via clustered reductions
+# (llama.cpp / Metal packed-GDN style). Default 8 on SG=64 devices.
+# Set MLX_GDN_VULKAN_DV_PACK=1 to restore one-Dv-per-subgroup launches.
+_VULKAN_DV_PACK = max(1, int(os.environ.get("MLX_GDN_VULKAN_DV_PACK", "8")))
 
 
 @partial(mx.compile, shapeless=True)
@@ -121,6 +127,7 @@ def _is_vulkan_available():
 
 
 _vulkan_subgroup_size_cache = None
+_vulkan_subgroup_clustered_cache = None
 
 
 def _vulkan_subgroup_size():
@@ -137,21 +144,73 @@ def _vulkan_subgroup_size():
     return _vulkan_subgroup_size_cache
 
 
-def _make_gated_delta_vulkan_kernel(has_mask=False, vectorized=False):
+def _vulkan_supports_subgroup_clustered():
+    """True when VK_SUBGROUP_FEATURE_CLUSTERED_BIT is available for compute.
+
+    Pack>1 kernels require subgroupClusteredAdd. The capability must be
+    queried up front: ``vulkan_kernel()`` construction is lazy, so a
+    try/except around kernel creation cannot detect compile/pipeline failure.
+    """
+    global _vulkan_subgroup_clustered_cache
+    if _vulkan_subgroup_clustered_cache is not None:
+        return _vulkan_subgroup_clustered_cache
+    if not _is_vulkan_available():
+        _vulkan_subgroup_clustered_cache = False
+        return False
+    try:
+        info = mx.device_info(mx.Device(mx.gpu, 0))
+        # Prefer the device_info flag from the Vulkan backend when present.
+        if "subgroup_clustered" in info:
+            _vulkan_subgroup_clustered_cache = bool(info["subgroup_clustered"])
+            return _vulkan_subgroup_clustered_cache
+    except Exception:
+        pass
+    # Older MLX builds without the flag: refuse pack>1 rather than risk a
+    # late pipeline-create crash.
+    _vulkan_subgroup_clustered_cache = False
+    return False
+
+
+def _vulkan_dv_pack(sg: int, dk: int = 0) -> int:
+    """Number of Dv rows packed into one Vulkan subgroup.
+
+    Uses clustered subgroup reductions so ``sg / pack`` lanes cooperate on
+    each Dv row (Metal packed-GDN / llama.cpp column packing). ``pack`` must
+    divide ``sg``; each lane holds ``dk / (sg / pack)`` state elements.
+    Requires subgroup clustered ops when pack > 1.
+    """
+    if sg < 32:
+        return 1
+    pack = min(_VULKAN_DV_PACK, sg)
+    if pack <= 1:
+        return 1
+    if not _vulkan_supports_subgroup_clustered():
+        return 1
+    # Prefer the largest power-of-two pack that divides sg and keeps a
+    # reasonable per-lane state footprint (state[32] bound below).
+    while pack > 1:
+        if sg % pack == 0:
+            lanes = sg // pack
+            if dk <= 0 or (dk % lanes == 0 and dk // lanes <= 32):
+                return pack
+        pack //= 2
+    return 1
+
+
+def _make_gated_delta_vulkan_kernel(has_mask=False, vectorized=False, dv_pack: int = 1):
     if not _is_vulkan_available():
         return None
     vulkan_kernel = getattr(mx.fast, "vulkan_kernel", None)
     if vulkan_kernel is None:
         return None
     sg = _vulkan_subgroup_size()
-    # The kernel uses a single `subgroupAdd` to reduce the workgroup, which
-    # is only correct when the workgroup spans a whole number of subgroups.
-    # Specialize the kernel on the device's subgroup size so the workgroup
-    # matches one subgroup exactly: this lets `subgroupAdd` cover the full
-    # workgroup, allows larger Dk (n_per_t = Dk / SG with the state[8] bound
-    # scales linearly with SG), and uses the hardware's full reduction width.
-    if sg < 32:
+    # Workgroup is one subgroup. dv_pack Dv rows share that subgroup;
+    # LANES_PER_DV = SG / DV_PACK lanes reduce each row with clustered add.
+    if sg < 32 or dv_pack < 1 or sg % dv_pack != 0:
         return None
+    if dv_pack > 1 and not _vulkan_supports_subgroup_clustered():
+        return None
+    lanes_per_dv = sg // dv_pack
 
     mask_source = "(mask.data[b_idx * T + t] != uint8_t(0))" if has_mask else "true"
     if vectorized:
@@ -159,18 +218,36 @@ def _make_gated_delta_vulkan_kernel(has_mask=False, vectorized=False):
     else:
         g_access = "read_GtT(g.data[(b_idx * T + t) * Hv + hv_idx])"
 
+    # GLSL requires a literal cluster size for subgroupClusteredAdd.
+    if dv_pack == 1:
+        reduce_expr = "subgroupAdd({0})"
+    else:
+        reduce_expr = f"subgroupClusteredAdd({{0}}, {lanes_per_dv}u)"
+
+    header = (
+        "#extension GL_KHR_shader_subgroup_arithmetic : require\n"
+        "#extension GL_KHR_shader_subgroup_basic : require\n"
+    )
+    if dv_pack > 1:
+        header += "#extension GL_KHR_shader_subgroup_clustered : require\n"
+
     source = f"""
         uint n = gl_GlobalInvocationID.z;
         uint b_idx = n / uint(Hv);
         uint hv_idx = n % uint(Hv);
         uint hk_idx = hv_idx / uint(Hv / Hk);
-        uint dk_lane = gl_LocalInvocationID.x;
-        uint dv_idx = gl_GlobalInvocationID.y;
+        // Cluster membership is defined by SubgroupInvocationID. Local and
+        // subgroup IDs are not required to match, so derive row/lane from the
+        // subgroup ID (same as llama.cpp gated_delta_net.comp).
+        uint lane = gl_SubgroupInvocationID;
+        uint dv_local = lane / {lanes_per_dv}u;
+        uint dk_lane = lane % {lanes_per_dv}u;
+        uint dv_idx = gl_WorkGroupID.y * {dv_pack}u + dv_local;
         bool active_dv = dv_idx < uint(Dv);
-        const uint n_per_t = uint(Dk / SG);
+        const uint n_per_t = uint(Dk / {lanes_per_dv});
 
         uint state_base = ((b_idx * uint(Hv) + hv_idx) * uint(Dv) + dv_idx) * uint(Dk);
-        float state[8];
+        float state[32];
         for (uint i = 0; i < n_per_t; ++i) {{
           uint s_idx = n_per_t * dk_lane + i;
           state[i] = active_dv ? read_StT(state_in.data[state_base + s_idx]) : 0.0;
@@ -188,7 +265,7 @@ def _make_gated_delta_vulkan_kernel(has_mask=False, vectorized=False):
             }}
           }}
 
-          kv_mem = subgroupAdd(kv_mem);
+          kv_mem = {reduce_expr.format("kv_mem")};
 
           uint v_idx = ((b_idx * uint(T) + t) * uint(Hv) + hv_idx) * uint(Dv) + dv_idx;
           float delta = is_active
@@ -206,7 +283,7 @@ def _make_gated_delta_vulkan_kernel(has_mask=False, vectorized=False):
             }}
           }}
 
-          out_acc = subgroupAdd(out_acc);
+          out_acc = {reduce_expr.format("out_acc")};
           if (dk_lane == 0 && active_dv) {{
             y.data[v_idx] = write_InT(is_active ? out_acc : 0.0);
           }}
@@ -228,13 +305,15 @@ def _make_gated_delta_vulkan_kernel(has_mask=False, vectorized=False):
         suffix += "_vec"
     if has_mask:
         suffix += "_mask"
+    if dv_pack > 1:
+        suffix += f"_p{dv_pack}"
 
     try:
         return vulkan_kernel(
             name=f"gated_delta_step{suffix}_sg{sg}",
             input_names=inputs,
             output_names=["y", "state_out"],
-            header="#extension GL_KHR_shader_subgroup_arithmetic : require\n",
+            header=header,
             source=source,
         )
     except RuntimeError:
@@ -247,18 +326,19 @@ _gated_delta_kernel_vec = _make_gated_delta_kernel(has_mask=False, vectorized=Tr
 _gated_delta_kernel_vec_masked = _make_gated_delta_kernel(
     has_mask=True, vectorized=True
 )
-_gated_delta_vulkan_kernel = _make_gated_delta_vulkan_kernel(
-    has_mask=False, vectorized=False
-)
-_gated_delta_vulkan_kernel_masked = _make_gated_delta_vulkan_kernel(
-    has_mask=True, vectorized=False
-)
-_gated_delta_vulkan_kernel_vec = _make_gated_delta_vulkan_kernel(
-    has_mask=False, vectorized=True
-)
-_gated_delta_vulkan_kernel_vec_masked = _make_gated_delta_vulkan_kernel(
-    has_mask=True, vectorized=True
-)
+
+# Vulkan kernels keyed by (has_mask, vectorized, dv_pack). Pack=1 is the
+# original one-Dv-per-subgroup path; higher packs use clustered reductions.
+_vulkan_kernel_cache = {}
+
+
+def _get_gated_delta_vulkan_kernel(has_mask: bool, vectorized: bool, dv_pack: int):
+    key = (has_mask, vectorized, dv_pack)
+    if key not in _vulkan_kernel_cache:
+        _vulkan_kernel_cache[key] = _make_gated_delta_vulkan_kernel(
+            has_mask=has_mask, vectorized=vectorized, dv_pack=dv_pack
+        )
+    return _vulkan_kernel_cache[key]
 
 
 @mx.compile
@@ -366,24 +446,32 @@ def gated_delta_vulkan_kernel(
     input_type = q.dtype
     state_type = state.dtype
     sg = _vulkan_subgroup_size()
-    if sg < 32 or Dk % sg != 0 or Dk // sg > 8:
+    # Prefill benefits from packing many Dv rows per subgroup; decode (T=1)
+    # is slightly faster with the original one-Dv-per-subgroup launch.
+    dv_pack = 1 if T == 1 else _vulkan_dv_pack(sg, Dk)
+    lanes = sg // max(dv_pack, 1)
+    if sg < 32 or Dk % lanes != 0 or Dk // lanes > 32:
         return gated_delta_ops(q, k, v, g, beta, state, mask)
 
-    if g.ndim == 4:
-        kernel = _gated_delta_vulkan_kernel_vec
-        inputs = [q, k, v, g, beta, state]
-        if mask is not None:
-            kernel = _gated_delta_vulkan_kernel_vec_masked
-            inputs.append(mask)
-    else:
-        kernel = _gated_delta_vulkan_kernel
-        inputs = [q, k, v, g, beta, state]
-        if mask is not None:
-            kernel = _gated_delta_vulkan_kernel_masked
-            inputs.append(mask)
+    vectorized = g.ndim == 4
+    has_mask = mask is not None
+    kernel = _get_gated_delta_vulkan_kernel(has_mask, vectorized, dv_pack)
+    inputs = [q, k, v, g, beta, state]
+    if has_mask:
+        inputs.append(mask)
+
+    if kernel is None and dv_pack > 1:
+        # Clustered-pack path unavailable; fall back to one Dv per subgroup.
+        dv_pack = 1
+        lanes = sg
+        if Dk % lanes != 0 or Dk // lanes > 32:
+            return gated_delta_ops(q, k, v, g, beta, state, mask)
+        kernel = _get_gated_delta_vulkan_kernel(has_mask, vectorized, 1)
 
     if kernel is None:
         return gated_delta_ops(q, k, v, g, beta, state, mask)
+
+    dv_tiles = (Dv + dv_pack - 1) // dv_pack
 
     return kernel(
         inputs=inputs,
@@ -398,8 +486,9 @@ def gated_delta_vulkan_kernel(
             ("Hk", Hk),
             ("Hv", Hv),
             ("SG", sg),
+            ("DV_PACK", dv_pack),
         ],
-        grid=(sg, Dv, B * Hv),
+        grid=(sg, dv_tiles, B * Hv),
         threadgroup=(sg, 1, 1),
         output_shapes=[(B, T, Hv, Dv), state.shape],
         output_dtypes=[input_type, state_type],
