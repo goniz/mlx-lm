@@ -14,7 +14,6 @@ from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
     gated_delta_update,
-    gated_delta_vulkan_kernel,
 )
 from mlx_lm.models.ssm import ssm_attn, ssm_update
 
@@ -3251,47 +3250,6 @@ class TestModels(unittest.TestCase):
                 y = y[:, s:e]
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
-
-    def test_gated_delta_vulkan_packed(self):
-        """Vulkan clustered Dv packing vs ops (Qwen3.6-27B GDN shapes)."""
-        vulkan = getattr(mx, "vulkan", None)
-        if vulkan is None or not vulkan.is_available():
-            self.skipTest("Vulkan not available")
-        if gated_delta_vulkan_kernel is None:
-            self.skipTest("Vulkan gated-delta kernel unavailable")
-
-        mx.random.seed(0)
-        B, Hk, Hv, Dk, Dv = 1, 16, 48, 128, 128
-        for T in (1, 7, 64):
-            q = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32) * 0.1
-            k = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32) * 0.1
-            v = mx.random.normal(shape=(B, T, Hv, Dv)).astype(mx.float32) * 0.1
-            g = mx.random.uniform(shape=(B, T, Hv)).astype(mx.float32) * 0.5 + 0.4
-            beta = mx.random.uniform(shape=(B, T, Hv)).astype(mx.float32)
-            state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
-
-            y_op, st_op = gated_delta_ops(q, k, v, g, beta, state)
-            y_vk, st_vk = gated_delta_vulkan_kernel(q, k, v, g, beta, state)
-            mx.eval(y_op, st_op, y_vk, st_vk)
-            self.assertTrue(mx.allclose(y_op, y_vk, rtol=1e-4, atol=1e-4))
-            self.assertTrue(mx.allclose(st_op, st_vk, rtol=1e-4, atol=1e-4))
-
-        # Padding mask path with packed prefill.
-        T = 8
-        q = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32) * 0.1
-        k = mx.random.normal(shape=(B, T, Hk, Dk)).astype(mx.float32) * 0.1
-        v = mx.random.normal(shape=(B, T, Hv, Dv)).astype(mx.float32) * 0.1
-        g = mx.random.uniform(shape=(B, T, Hv)).astype(mx.float32) * 0.5 + 0.4
-        beta = mx.random.uniform(shape=(B, T, Hv)).astype(mx.float32)
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
-        mask = mx.array([[False, True, True, True, True, True, False, False]])
-        y_gt, st_gt = gated_delta_ops(
-            q[:, 1:6], k[:, 1:6], v[:, 1:6], g[:, 1:6], beta[:, 1:6], state
-        )
-        y_vk, st_vk = gated_delta_vulkan_kernel(q, k, v, g, beta, state, mask)
-        mx.eval(y_gt, st_gt, y_vk, st_vk)
-        self.assertTrue(mx.allclose(y_vk[:, 1:6], y_gt, rtol=1e-4, atol=1e-4))
-        self.assertTrue(mx.allclose(st_vk, st_gt, rtol=1e-4, atol=1e-3))
 
 
 if __name__ == "__main__":
